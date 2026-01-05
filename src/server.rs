@@ -25,9 +25,98 @@ use std::{
 	str::{from_utf8, Split},
 	string::ToString,
 };
-use time::Duration;
+use time::OffsetDateTime;
 
-use crate::dbg_msg;
+use crate::{config, dbg_msg};
+
+const BANNED_USER_AGENTS: &[&str] = &[
+	"AI2Bot",
+	"Ai2Bot-Dolma",
+	"Amazonbot",
+	"Andibot",
+	"Applebot",
+	"Applebot-Extended",
+	"Awario",
+	"Brightbot 1.0",
+	"Bytespider",
+	"CCBot",
+	"ChatGPT-User",
+	"Claude-SearchBot",
+	"Claude-User",
+	"Claude-Web",
+	"ClaudeBot",
+	"Cotoyogi",
+	"Crawlspace",
+	"Datenbank Crawler",
+	"Devin",
+	"Diffbot",
+	"DuckAssistBot",
+	"Echobot Bot",
+	"EchoboxBot",
+	"FacebookBot",
+	"Factset_spyderbot",
+	"FirecrawlAgent",
+	"FriendlyCrawler",
+	"GPTBot",
+	"Google-CloudVertexBot",
+	"Google-Extended",
+	"GoogleOther",
+	"GoogleOther-Image",
+	"GoogleOther-Video",
+	"ICC-Crawler",
+	"ISSCyberRiskCrawler",
+	"ImagesiftBot",
+	"Kangaroo Bot",
+	"Meta-ExternalAgent",
+	"Meta-ExternalFetcher",
+	"MistralAI-User",
+	"MistralAI-User/1.0",
+	"MyCentralAIScraperBot",
+	"NovaAct",
+	"OAI-SearchBot",
+	"Operator",
+	"PanguBot",
+	"Panscient",
+	"Perplexity-User",
+	"PerplexityBot",
+	"PetalBot",
+	"PhindBot",
+	"Poseidon Research Crawler",
+	"QualifiedBot",
+	"QuillBot",
+	"SBIntuitionsBot",
+	"Scrapy",
+	"SemrushBot",
+	"SemrushBot-BA",
+	"SemrushBot-CT",
+	"SemrushBot-OCOB",
+	"SemrushBot-SI",
+	"SemrushBot-SWA",
+	"Sidetrade indexer bot",
+	"TikTokSpider",
+	"Timpibot",
+	"VelenPublicWebCrawler",
+	"WARDBot",
+	"Webzio-Extended",
+	"YandexAdditional",
+	"YandexAdditionalBot",
+	"YouBot",
+	"aiHitBot",
+	"anthropic-ai",
+	"bedrockbot",
+	"cohere-ai",
+	"cohere-training-data-crawler",
+	"facebookexternalhit",
+	"iaskspider/2.0",
+	"img2dataset",
+	"meta-externalagent",
+	"meta-externalfetcher",
+	"omgili",
+	"omgilibot",
+	"panscient.com",
+	"quillbot.com",
+	"wpbot",
+];
 
 type BoxResponse = Pin<Box<dyn Future<Output = Result<Response<Body>, String>> + Send>>;
 
@@ -170,10 +259,8 @@ impl ResponseExt for Response<Body> {
 	}
 
 	fn remove_cookie(&mut self, name: String) {
-		let mut cookie = Cookie::from(name);
-		cookie.set_path("/");
-		cookie.set_max_age(Duration::seconds(1));
-		if let Ok(val) = header::HeaderValue::from_str(&cookie.to_string()) {
+		let removal_cookie = Cookie::build(name).path("/").http_only(true).expires(OffsetDateTime::now_utc());
+		if let Ok(val) = header::HeaderValue::from_str(&removal_cookie.to_string()) {
 			self.headers_mut().append("Set-Cookie", val);
 		}
 	}
@@ -232,6 +319,23 @@ impl Server {
 					let req_headers = req.headers().clone();
 					let def_headers = default_headers.clone();
 
+					// Catch robots.txt-disrespecful bots who still identify themselves
+					// Typically justified as "human triggered" actions.
+					if match config::get_setting("REDLIB_ROBOTS_DISABLE_INDEXING") {
+						Some(val) => val == "on",
+						None => false,
+					} {
+						if let Some(user_agent) = req_headers.get("user-agent") {
+							if let Ok(user_agent_str) = user_agent.to_str() {
+								for banned in BANNED_USER_AGENTS {
+									if user_agent_str.contains(banned) {
+										return new_boilerplate(def_headers, req_headers, 403, Body::from("Forbidden")).boxed();
+									}
+								}
+							}
+						}
+					}
+
 					// Remove double slashes and decode encoded slashes
 					let mut path = req.uri().path().replace("//", "/").replace("%2F", "/");
 
@@ -240,8 +344,14 @@ impl Server {
 						path.pop();
 					}
 
+					// Replace HEAD with GET for routing
+					let (method, is_head) = match req.method() {
+						&Method::HEAD => (&Method::GET, true),
+						method => (method, false),
+					};
+
 					// Match the visited path with an added route
-					match router.recognize(&format!("/{}{}", req.method().as_str(), path)) {
+					match router.recognize(&format!("/{}{}", method.as_str(), path)) {
 						// If a route was configured for this path
 						Ok(found) => {
 							let mut parammed = req;
@@ -253,17 +363,21 @@ impl Server {
 								match func.await {
 									Ok(mut res) => {
 										res.headers_mut().extend(def_headers);
-										let _ = compress_response(&req_headers, &mut res).await;
+										if is_head {
+											*res.body_mut() = Body::empty();
+										} else {
+											let _ = compress_response(&req_headers, &mut res).await;
+										}
 
 										Ok(res)
 									}
-									Err(msg) => new_boilerplate(def_headers, req_headers, 500, Body::from(msg)).await,
+									Err(msg) => new_boilerplate(def_headers, req_headers, 500, if is_head { Body::empty() } else { Body::from(msg) }).await,
 								}
 							}
 							.boxed()
 						}
 						// If there was a routing error
-						Err(e) => new_boilerplate(def_headers, req_headers, 404, e.into()).boxed(),
+						Err(e) => new_boilerplate(def_headers, req_headers, 404, if is_head { Body::empty() } else { e.into() }).boxed(),
 					}
 				}))
 			}
@@ -274,8 +388,19 @@ impl Server {
 
 		// Bind server to address specified above. Gracefully shut down if CTRL+C is pressed
 		let server = HyperServer::bind(address).serve(make_svc).with_graceful_shutdown(async {
+			#[cfg(windows)]
 			// Wait for the CTRL+C signal
 			tokio::signal::ctrl_c().await.expect("Failed to install CTRL+C signal handler");
+
+			#[cfg(unix)]
+			{
+				// Wait for CTRL+C or SIGTERM signals
+				let mut signal_terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("Failed to install SIGTERM signal handler");
+				tokio::select! {
+					_ = tokio::signal::ctrl_c() => (),
+					_ = signal_terminate.recv() => ()
+				}
+			}
 		});
 
 		server.boxed()
@@ -543,8 +668,12 @@ async fn compress_response(req_headers: &HeaderMap<header::HeaderValue>, res: &m
 		Ok(compressed) => {
 			// We get here iff the compression was successful. Replace the body
 			// with the compressed payload, and add the appropriate
-			// Content-Encoding header in the response.
-			res.headers_mut().insert(header::CONTENT_ENCODING, compressor.to_string().parse().unwrap());
+			// Content-Encoding header in the response. Remove any precomputed
+			// Content-Length, as it will no longer be valid.
+			let headers = res.headers_mut();
+			headers.insert(header::CONTENT_ENCODING, compressor.to_string().parse().unwrap());
+			headers.remove(header::CONTENT_LENGTH);
+
 			*(res.body_mut()) = Body::from(compressed);
 		}
 
@@ -730,7 +859,7 @@ mod tests {
 
 				CompressionType::Brotli => Box::new(BrotliDecompressor::new(body_cursor, expected_lorem_ipsum.len())),
 
-				_ => panic!("no decompressor for {}", expected_encoding),
+				_ => panic!("no decompressor for {expected_encoding}"),
 			};
 
 			let mut decompressed = Vec::<u8>::new();

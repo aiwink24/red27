@@ -5,12 +5,12 @@
 use cached::proc_macro::cached;
 use clap::{Arg, ArgAction, Command};
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use futures_lite::FutureExt;
 use hyper::Uri;
 use hyper::{header::HeaderValue, Body, Request, Response};
 use log::{info, warn};
-use once_cell::sync::Lazy;
 use redlib::client::{canonical_path, proxy, rate_limit_check, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
@@ -64,6 +64,17 @@ async fn font() -> Result<Response<Body>, String> {
 	)
 }
 
+async fn opensearch() -> Result<Response<Body>, String> {
+	Ok(
+		Response::builder()
+			.status(200)
+			.header("content-type", "application/opensearchdescription+xml")
+			.header("Cache-Control", "public, max-age=1209600, s-maxage=86400")
+			.body(include_bytes!("../static/opensearch.xml").as_ref().into())
+			.unwrap_or_default(),
+	)
+}
+
 async fn resource(body: &str, content_type: &str, cache: bool) -> Result<Response<Body>, String> {
 	let mut res = Response::builder()
 		.status(200)
@@ -108,6 +119,8 @@ async fn main() {
 	let matches = Command::new("Redlib")
 		.version(env!("CARGO_PKG_VERSION"))
 		.about("Private front-end for Reddit written in Rust ")
+		.arg(Arg::new("ipv4-only").short('4').long("ipv4-only").help("Listen on IPv4 only").num_args(0))
+		.arg(Arg::new("ipv6-only").short('6').long("ipv6-only").help("Listen on IPv6 only").num_args(0))
 		.arg(
 			Arg::new("redirect-https")
 				.short('r')
@@ -151,12 +164,12 @@ async fn main() {
 			info!("[✅] Rate limit check passed");
 		}
 		Err(e) => {
-			let mut message = format!("Rate limit check failed: {}", e);
+			let mut message = format!("Rate limit check failed: {e}");
 			message += "\nThis may cause issues with the rate limit.";
 			message += "\nPlease report this error with the above information.";
 			message += "\nhttps://github.com/redlib-org/redlib/issues/new?assignees=sigaloid&labels=bug&title=%F0%9F%90%9B+Bug+Report%3A+Rate+limit+mismatch";
 			warn!("{}", message);
-			eprintln!("{}", message);
+			eprintln!("{message}");
 		}
 	}
 
@@ -164,7 +177,16 @@ async fn main() {
 	let port = matches.get_one::<String>("port").unwrap();
 	let hsts = matches.get_one("hsts").map(|m: &String| m.as_str());
 
-	let listener = [address, ":", port].concat();
+	let ipv4_only = std::env::var("IPV4_ONLY").is_ok() || matches.get_flag("ipv4-only");
+	let ipv6_only = std::env::var("IPV6_ONLY").is_ok() || matches.get_flag("ipv6-only");
+
+	let listener = if ipv4_only {
+		format!("0.0.0.0:{port}")
+	} else if ipv6_only {
+		format!("[::]:{port}")
+	} else {
+		[address, ":", port].concat()
+	};
 
 	println!("Starting Redlib...");
 
@@ -178,11 +200,11 @@ async fn main() {
 	// at first request
 
 	info!("Evaluating config.");
-	Lazy::force(&config::CONFIG);
+	LazyLock::force(&config::CONFIG);
 	info!("Evaluating instance info.");
-	Lazy::force(&instance_info::INSTANCE_INFO);
+	LazyLock::force(&instance_info::INSTANCE_INFO);
 	info!("Creating OAUTH client.");
-	Lazy::force(&OAUTH_CLIENT);
+	LazyLock::force(&OAUTH_CLIENT);
 
 	// Define default headers (added to all responses)
 	app.default_headers = headers! {
@@ -223,6 +245,7 @@ async fn main() {
 	app.at("/Inter.var.woff2").get(|_| font().boxed());
 	app.at("/touch-icon-iphone.png").get(|_| iphone_logo().boxed());
 	app.at("/apple-touch-icon.png").get(|_| iphone_logo().boxed());
+	app.at("/opensearch.xml").get(|_| opensearch().boxed());
 	app
 		.at("/playHLSVideo.js")
 		.get(|_| resource(include_str!("../static/playHLSVideo.js"), "text/javascript", false).boxed());
@@ -235,6 +258,7 @@ async fn main() {
 	app
 		.at("/check_update.js")
 		.get(|_| resource(include_str!("../static/check_update.js"), "text/javascript", false).boxed());
+	app.at("/copy.js").get(|_| resource(include_str!("../static/copy.js"), "text/javascript", false).boxed());
 
 	app.at("/commits.atom").get(|_| async move { proxy_commit_info().await }.boxed());
 	app.at("/instances.json").get(|_| async move { proxy_instances().await }.boxed());
@@ -273,6 +297,7 @@ async fn main() {
 	// Configure settings
 	app.at("/settings").get(|r| settings::get(r).boxed()).post(|r| settings::set(r).boxed());
 	app.at("/settings/restore").get(|r| settings::restore(r).boxed());
+	app.at("/settings/encoded-restore").post(|r| settings::encoded_restore(r).boxed());
 	app.at("/settings/update").get(|r| settings::update(r).boxed());
 
 	// RSS Subscriptions
@@ -369,7 +394,7 @@ async fn main() {
 				Some("best" | "hot" | "new" | "top" | "rising" | "controversial") => subreddit::community(req).await,
 
 				// Short link for post
-				Some(id) if (5..8).contains(&id.len()) => match canonical_path(format!("/{id}"), 3).await {
+				Some(id) if (5..8).contains(&id.len()) => match canonical_path(format!("/comments/{id}"), 3).await {
 					Ok(path_opt) => match path_opt {
 						Some(path) => Ok(redirect(&path)),
 						None => error(req, "Post ID is invalid. It may point to a post on a community that has been banned.").await,
